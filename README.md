@@ -1,12 +1,18 @@
 # PacketGame
 
-PacketGame is a pre-decoding plug-in for concurrent video inference at scale.
+PacketGame is a pre-decoding packet filter for concurrent video inference at scale.
 
 Our paper "PacketGame: Multi-Stream Packet Gating for Concurrent Video Inference at Scale" is going to appear at *ACM SIGCOMM 2023*.
 
 ## Installation
 
 OS: Ubuntu 20.04
+
+### Tensorflow/Mindspore
+
+We implement the neural network-based contextual predictor in PacketGame by Tensorflow 2.4.1 and Mindspore 2.0.0.
+
+Please refer to the installation docs: [Tensorflow](https://www.tensorflow.org/install) / [Mindspore](https://www.mindspore.cn/install)
 
 ### FFmpeg with nv-codec
 
@@ -85,6 +91,192 @@ python concurrent_decode.py
            40         23.5301   424.988
            45         25.1256   447.75
            50         27.077    461.646
+```
+
+## Contextual Predictor
+
+<img src="./.github/nn.png" height="300">
+
+Implementation using TensorFlow (`src/contextual_tf.py`):
+```python
+def build_ensemble_threeview(inp_len1=5, inp_len2=5, inp_len3=1, conv_units=[32, 32], dense_unit=128):
+    """
+    build three-view neural network 
+
+    Args:
+        inp_len1, inp_len2, inp_len3 (int): input length of three views, 5 for inp1 & inp2 and 1 for inp3 by default
+        conv_units (list of int): number of conv1d units
+            by default, two conv1d layers with 32 units
+        dense_unit (int): number of dense units, 128 by default
+    Return:
+        tf.keras.Model instance
+    """
+    inp1 = layers.Input(shape=(None, inp_len1), name="View1-Indepdendent")
+    inp2 = layers.Input(shape=(None, inp_len2), name="View2-Predicted")
+    inp3 = layers.Input(shape=(inp_len3), name="View3-Temporal")
+    x1 = inp1
+    x2 = inp2 
+    x3 = inp3
+    for u in conv_units:
+        x1 = layers.Conv1D(u, 1, activation="relu")(x1)
+        x2 = layers.Conv1D(u, 1, activation="relu")(x2)
+    x1 = layers.GlobalMaxPooling1D()(x1)
+    x2 = layers.GlobalMaxPooling1D()(x2)
+    x = layers.Concatenate()([x1, x2])
+    out = layers.Dense(1, activation="sigmoid")(x)
+    x4 = layers.Concatenate()([out, x3])
+    x4 = layers.Dense(dense_unit, activation="relu")(x4)
+    out2 = layers.Dense(1, activation='sigmoid')(x4)
+    return tf.keras.Model(inputs=[inp1, inp2, inp3], outputs=out2)
+
+m = build_ensemble_threeview(inp_len1=5, inp_len2=5, inp_len3=1, conv_units=[32, 32], dense_unit=128)
+print(m.summary())
+--------------------------------------------------------------------------------------------------
+Model: "model_1"
+__________________________________________________________________________________________________
+Layer (type)                    Output Shape         Param #     Connected to                     
+==================================================================================================
+View1-Indepdendent (InputLayer) [(None, None, 5)]    0                                            
+__________________________________________________________________________________________________
+View2-Predicted (InputLayer)    [(None, None, 5)]    0                                            
+__________________________________________________________________________________________________
+conv1d_4 (Conv1D)               (None, None, 32)     192         View1-Indepdendent[0][0]         
+__________________________________________________________________________________________________
+conv1d_5 (Conv1D)               (None, None, 32)     192         View2-Predicted[0][0]            
+__________________________________________________________________________________________________
+conv1d_6 (Conv1D)               (None, None, 32)     1056        conv1d_4[0][0]                   
+__________________________________________________________________________________________________
+conv1d_7 (Conv1D)               (None, None, 32)     1056        conv1d_5[0][0]                   
+__________________________________________________________________________________________________
+global_max_pooling1d_2 (GlobalM (None, 32)           0           conv1d_6[0][0]                   
+__________________________________________________________________________________________________
+global_max_pooling1d_3 (GlobalM (None, 32)           0           conv1d_7[0][0]                   
+__________________________________________________________________________________________________
+concatenate_1 (Concatenate)     (None, 64)           0           global_max_pooling1d_2[0][0]     
+                                                                 global_max_pooling1d_3[0][0]     
+__________________________________________________________________________________________________
+dense_1 (Dense)                 (None, 1)            65          concatenate_1[0][0]              
+__________________________________________________________________________________________________
+View3-Temporal (InputLayer)     [(None, 1)]          0                                            
+__________________________________________________________________________________________________
+concatenate_2 (Concatenate)     (None, 2)            0           dense_1[0][0]                    
+                                                                 View3-Temporal[0][0]             
+__________________________________________________________________________________________________
+dense_2 (Dense)                 (None, 128)          384         concatenate_2[0][0]              
+__________________________________________________________________________________________________
+dense_3 (Dense)                 (None, 1)            129         dense_2[0][0]                    
+==================================================================================================
+Total params: 3,074
+Trainable params: 3,074
+Non-trainable params: 0
+__________________________________________________________________________________________________
+```
+
+Implementation using MindSpore (`src/contextual_ms.py`):
+```python
+class EnsembleThreeview(nn.Cell):
+    def __init__(self, inp_len1=5, inp_len2=5, inp_len3=1, conv_units=[32, 32], dense_unit=128):
+        super(EnsembleThreeview, self).__init__()
+        
+        self.view1_layers = nn.CellList([nn.Conv1d(inp_len1, conv_units[0], 1, has_bias=True, pad_mode='valid'),
+                                         nn.ReLU()])
+        self.view2_layers = nn.CellList([nn.Conv1d(inp_len2, conv_units[0], 1, has_bias=True, pad_mode='valid'),
+                                         nn.ReLU()])
+        
+        for i in range(len(conv_units)-1):
+            self.view1_layers.append(nn.Conv1d(conv_units[i], conv_units[i+1], 1, has_bias=True, pad_mode='valid'))
+            self.view1_layers.append(nn.ReLU())
+            
+            self.view2_layers.append(nn.Conv1d(conv_units[i], conv_units[i+1], 1, has_bias=True, pad_mode='valid'))
+            self.view2_layers.append(nn.ReLU())
+        
+        self.view1_layers.append(nn.AdaptiveMaxPool1d(1))
+        self.view2_layers.append(nn.AdaptiveMaxPool1d(1))
+        
+        self.dense = nn.Dense(conv_units[-1]*2, 1, has_bias=True)
+        self.sigmoid = nn.Sigmoid()
+        
+        self.dense2 = nn.Dense(1+inp_len3, dense_unit, has_bias=True)
+        self.relu = nn.ReLU()
+        self.dense3 = nn.Dense(dense_unit, 1, has_bias=True)
+
+    def construct(self, x1, x2, x3):
+        for v1_layer, v2_layer in zip(self.view1_layers, self.view2_layers):
+            x1 = v1_layer(x1)
+            x2 = v2_layer(x2)
+        x = ops.cat((x1, x2), axis=1)
+        x = ops.squeeze(x, axis=-1)
+        x = self.dense(x)
+        x = self.sigmoid(x)
+        
+        x = ops.cat((x, x3), axis=1)
+        x = self.dense2(x)
+        x = self.relu(x)
+        x = self.dense3(x)
+        x = self.sigmoid(x)
+        
+        return x
+
+net = EnsembleThreeview(inp_len1=5, inp_len2=5, inp_len3=1, conv_units=[32, 32], dense_unit=128)
+print(net)
+------------------------------------------------------------------------------------
+EnsembleThreeview<
+  (view1_layers): CellList<
+    (0): Conv1d<input_channels=5, output_channels=32, kernel_size=(1, 1), stride=(1, 1), pad_mode=valid, padding=(0, 0, 0, 0), dilation=(1, 1), group=1, has_bias=True, weight_init=normal, bias_init=zeros, format=NCHW>
+    (1): ReLU<>
+    (2): Conv1d<input_channels=32, output_channels=32, kernel_size=(1, 1), stride=(1, 1), pad_mode=valid, padding=(0, 0, 0, 0), dilation=(1, 1), group=1, has_bias=True, weight_init=normal, bias_init=zeros, format=NCHW>
+    (3): ReLU<>
+    (4): AdaptiveMaxPool1d<>
+    >
+  (view2_layers): CellList<
+    (0): Conv1d<input_channels=5, output_channels=32, kernel_size=(1, 1), stride=(1, 1), pad_mode=valid, padding=(0, 0, 0, 0), dilation=(1, 1), group=1, has_bias=True, weight_init=normal, bias_init=zeros, format=NCHW>
+    (1): ReLU<>
+    (2): Conv1d<input_channels=32, output_channels=32, kernel_size=(1, 1), stride=(1, 1), pad_mode=valid, padding=(0, 0, 0, 0), dilation=(1, 1), group=1, has_bias=True, weight_init=normal, bias_init=zeros, format=NCHW>
+    (3): ReLU<>
+    (4): AdaptiveMaxPool1d<>
+    >
+  (dense): Dense<input_channels=64, output_channels=1, has_bias=True>
+  (sigmoid): Sigmoid<>
+  (dense2): Dense<input_channels=2, output_channels=128, has_bias=True>
+  (relu): ReLU<>
+  (dense3): Dense<input_channels=128, output_channels=1, has_bias=True>
+  >
+
+x1 = mindspore.Tensor(np.ones([1, 5, 1]), mindspore.float32)
+x2 = mindspore.Tensor(np.ones([1, 5, 1]), mindspore.float32)
+x3 = mindspore.Tensor(np.ones([1, 1]), mindspore.float32)
+print(net(x1, x2, x3).shape)
+------------------------------
+(1, 1)
+
+total_params = 0
+for v in net.parameters_dict().values():
+    print(v, v.size)
+    total_params += v.size
+print(total_params)
+-----------------------
+Parameter (name=view1_layers.0.weight, shape=(32, 5, 1, 1), dtype=Float32, requires_grad=True) 160
+Parameter (name=view1_layers.0.bias, shape=(32,), dtype=Float32, requires_grad=True) 32
+Parameter (name=view1_layers.2.weight, shape=(32, 32, 1, 1), dtype=Float32, requires_grad=True) 1024
+Parameter (name=view1_layers.2.bias, shape=(32,), dtype=Float32, requires_grad=True) 32
+Parameter (name=view2_layers.0.weight, shape=(32, 5, 1, 1), dtype=Float32, requires_grad=True) 160
+Parameter (name=view2_layers.0.bias, shape=(32,), dtype=Float32, requires_grad=True) 32
+Parameter (name=view2_layers.2.weight, shape=(32, 32, 1, 1), dtype=Float32, requires_grad=True) 1024
+Parameter (name=view2_layers.2.bias, shape=(32,), dtype=Float32, requires_grad=True) 32
+Parameter (name=dense.weight, shape=(1, 64), dtype=Float32, requires_grad=True) 64
+Parameter (name=dense.bias, shape=(1,), dtype=Float32, requires_grad=True) 1
+Parameter (name=dense2.weight, shape=(128, 2), dtype=Float32, requires_grad=True) 256
+Parameter (name=dense2.bias, shape=(128,), dtype=Float32, requires_grad=True) 128
+Parameter (name=dense3.weight, shape=(1, 128), dtype=Float32, requires_grad=True) 128
+Parameter (name=dense3.bias, shape=(1,), dtype=Float32, requires_grad=True) 1
+3074
+```
+
+## Citation
+
+If you find this repository helpful, please consider citing the following paper:
+```
+Mu Yuan, Lan Zhang, Xuanke You, and Xiang-Yang Li. 2023. PacketGame: Multi-Stream Packet Gating for Concurrent Video Inference at Scale. In ACM SIGCOMM 2023 Conference (ACM SIGCOMM ’23), September 10–14, 2023, New York, NY, USA. ACM, New York, NY, USA, 14 pages. https://doi.org/10.1145/3603269.3604825
 ```
 
 ## License
